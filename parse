@@ -1,0 +1,120 @@
+import re, ipaddress
+from email.utils import parsedate_to_datetime
+from datetime import timezone
+
+IPV4 = r"(?:\d{1,3}\.){3}\d{1,3}"
+IPV6 = r"(?:[A-Fa-f0-9:]+)"
+IP_ANY = rf"(?:{IPV4}|{IPV6})"
+BRACKETED_IP = rf"\[(?:IPv6:)?({IP_ANY})\]"
+HOST = r"[A-Za-z0-9_.-]+"
+TLS_RE = re.compile(r"\bTLS[^\s;]*\b.*?(?=;|$)", re.IGNORECASE)
+
+PATTERNS = [
+    re.compile(
+        rf"from\s+(?P<from_host>{HOST})(?:\s*\({HOST}\s*{BRACKETED_IP}\))?"
+        rf"\s+by\s+(?P<by_host>{HOST})(?:\s*\({HOST}\s*{BRACKETED_IP}\))?"
+        rf"(?:\s+with\s+(?P<with>[\w-]+))?"
+        rf"(?:\s+via\s+(?P<via>[\w-]+))?"
+        rf"(?:.*?;\s*(?P<date>.+))?$",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        rf"from\s+{BRACKETED_IP}\s+by\s+(?P<by_host>{HOST})(?:\s*\({HOST}\s*{BRACKETED_IP}\))?"
+        rf"(?:\s+with\s+(?P<with>[\w-]+))?(?:.*?;\s*(?P<date>.+))?$",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        rf"by\s+(?P<by_host>{HOST})(?:\s*\({HOST}\s*{BRACKETED_IP}\))?"
+        rf"(?:\s+with\s+(?P<with>[\w-]+))?(?:.*?;\s*(?P<date>.+))?$",
+        re.IGNORECASE | re.DOTALL,
+    ),
+]
+
+def _norm_ip(x):
+    if not x: return None
+    try: return str(ipaddress.ip_address(x))
+    except ValueError: return None
+
+def _first_ip(text):
+    if not text: return None
+    m = re.search(BRACKETED_IP, text)
+    if m: return _norm_ip(m.group(1))
+    m2 = re.search(IP_ANY, text)
+    return _norm_ip(m2.group(0)) if m2 else None
+
+def _find_after(text, kw):
+    m = re.search(rf"\b{kw}\b\s+([^\s;()]+)", text, re.IGNORECASE)
+    return m.group(1) if m else None
+
+def _parse_date(s):
+    if not s: return None
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt and dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    except Exception:
+        return s.strip()
+
+def parse_received_header_string(received_str: str) -> dict:
+    flat = " ".join(received_str.split())
+    out = {"raw": received_str}
+    for pat in PATTERNS:
+        m = pat.search(flat)
+        if m:
+            gd = m.groupdict()
+            # infer IPs around 'from' and 'by'
+            from_ip = _first_ip(flat.split(" by ")[0]) if " by " in flat else _first_ip(flat)
+            by_ip = None
+            if gd.get("by_host"):
+                post_by = flat.split(f" by {gd['by_host']}", 1)[-1]
+                by_ip = _first_ip(post_by)
+            tls = TLS_RE.search(flat)
+            out.update({
+                "from_host": gd.get("from_host"),
+                "from_ip": from_ip,
+                "by_host": gd.get("by_host"),
+                "by_ip": by_ip,
+                "with": gd.get("with"),
+                "via": gd.get("via"),
+                "tls": tls.group(0) if tls else None,
+                "date": _parse_date(gd.get("date")),
+            })
+            # normalize IPs
+            out["from_ip"] = _norm_ip(out["from_ip"])
+            out["by_ip"]   = _norm_ip(out["by_ip"])
+            return out
+
+    # fallback if no pattern matched
+    tls = TLS_RE.search(flat)
+    date_candidate = flat.rsplit(";", 1)[-1].strip() if ";" in flat and not flat.strip().endswith(";") else None
+    out.update({
+        "from_host": _find_after(flat, "from"),
+        "from_ip": _first_ip(flat),
+        "by_host": _find_after(flat, "by"),
+        "by_ip": None,
+        "with": _find_after(flat, "with"),
+        "via": _find_after(flat, "via"),
+        "tls": tls.group(0) if tls else None,
+        "date": _parse_date(date_candidate),
+    })
+    return out
+
+# Example
+s = "from mail-eopbgr123.outbound.protection.outlook.com (mail-eopbgr123.outbound.protection.outlook.com [40.107.2.22]) by mx.example.net (mx.example.net [203.0.113.10]) with SMTP; Tue, 27 Aug 2025 13:55:42 -0400"
+print(parse_received_header_string(s))
+
+
+
+~~~~~~~~~~~~~~~~~~
+# pip install mail-parser
+from mailparser import parse_from_bytes
+
+def parse_received_with_mailparser(received_str: str):
+    fake_msg = f"Received: {received_str}\r\n\r\n".encode("utf-8")
+    mail = parse_from_bytes(fake_msg)
+    # mail.received is a list; we have only one header, so take [0]
+    return mail.received[0] if mail.received else {}
+
+# Example
+print(parse_received_with_mailparser("from hostA (hostA [192.0.2.1]) by hostB with SMTP; Wed, 28 Aug 2025 10:00:00 +0000"))
+
