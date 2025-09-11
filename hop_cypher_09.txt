@@ -1,0 +1,108 @@
+import json, psycopg2
+
+conn = psycopg2.connect(
+    dbname="postgresDB", user="postgresUser", password="postgresPW",
+    host="localhost", port="5455",
+)
+conn.autocommit = True
+cur = conn.cursor()
+
+# Setup
+cur.execute("CREATE EXTENSION IF NOT EXISTS age;")
+cur.execute("LOAD 'age';")
+cur.execute('SET search_path = ag_catalog, "$user", public;')
+cur.execute("SELECT 1 FROM ag_catalog.ag_graph WHERE name = %s;", ("demo_clean",))
+if cur.fetchone() is None:
+    cur.execute("SELECT * FROM create_graph(%s);", ("demo_clean",))
+
+# Your data
+row = {"from_name": "fromname_5", "from_ip": "203.0.113.17", "by_ip": "198.51.100.27", "by_name": "by_name5", "msg_ids": ["msg_id5"], "cnt": 1, "timestamp": "Friday 2024"}
+
+def upsert_hop_relationship(graph_name, row):
+    """Clean upsert function for HOP relationships"""
+
+    # 1. Ensure nodes exist with consistent property names
+    cypher_query = f"""
+    SELECT * FROM cypher('{graph_name}', $$
+      MERGE (a:Host {{name: '{row["from_name"]}', ip: '{row["from_ip"]}'}})
+      MERGE (b:Host {{name: '{row["by_name"]}', ip: '{row["by_ip"]}'}})
+      RETURN count(*)
+    $$) AS (result BIGINT);
+    """
+
+    cur.execute(cypher_query)
+    print("Nodes ensured:", cur.fetchall())
+
+    # 2. Check if relationship exists
+    check_query = f"""
+    SELECT * FROM cypher('{graph_name}', $$
+      MATCH (a:Host {{ip: '{row["from_ip"]}'}})
+      MATCH (b:Host {{ip: '{row["by_ip"]}'}})
+      OPTIONAL MATCH (a)-[r:HOP]->(b)
+      RETURN r IS NOT NULL, 
+             CASE WHEN r IS NULL THEN 0 ELSE r.cnt END,
+             CASE WHEN r IS NULL THEN [] ELSE r.msg_ids END
+    $$) AS (exists BOOLEAN, current_cnt BIGINT, current_msg_ids agtype);
+    """
+
+    cur.execute(check_query)
+    result = cur.fetchone()
+    exists, current_cnt, current_msg_ids = result if result else (False, 0, [])
+
+    print(f"Relationship exists: {exists}, current_cnt: {current_cnt}")
+
+    if exists:
+        # 3a. Update existing relationship
+        update_query = f"""
+        SELECT * FROM cypher('{graph_name}', $$
+          MATCH (a:Host {{ip: '{row["from_ip"]}'}})
+          MATCH (b:Host {{ip: '{row["by_ip"]}'}})
+          MATCH (a)-[r:HOP]->(b)
+          SET r.cnt = r.cnt + {row["cnt"]},
+              r.msg_ids = r.msg_ids + {json.dumps(row["msg_ids"])},
+              r.timestamp = '{row["timestamp"]}'
+          RETURN r.cnt, r.msg_ids, r.timestamp
+        $$) AS (cnt BIGINT, msg_ids agtype, timestamp agtype);
+        """
+
+        cur.execute(update_query)
+        print("Relationship updated:", cur.fetchall())
+    else:
+        # 3b. Create new relationship with properties
+        create_query = f"""
+        SELECT * FROM cypher('{graph_name}', $$
+          MATCH (a:Host {{ip: '{row["from_ip"]}'}})
+          MATCH (b:Host {{ip: '{row["by_ip"]}'}})
+          CREATE (a)-[r:HOP {{cnt: {row["cnt"]}, msg_ids: {json.dumps(row["msg_ids"])}, timestamp: '{row["timestamp"]}'}}]->(b)
+          RETURN r.cnt, r.msg_ids, r.timestamp
+        $$) AS (cnt BIGINT, msg_ids agtype, timestamp agtype);
+        """
+
+        cur.execute(create_query)
+        print("Relationship created:", cur.fetchall())
+
+# Test the function
+upsert_hop_relationship("demo_clean", row)
+
+# Verify results
+cur.execute("""
+SELECT *FROM cypher('demo_clean', $$
+  MATCH (a:Host)-[r:HOP]->(b:Host)
+  RETURN a.name, a.ip, r.cnt, r.msg_ids, r.timestamp, b.name, b.ip
+$$) AS (from_name agtype, from_ip agtype, cnt agtype, msg_ids agtype, timestamp agtype, to_name agtype, to_ip agtype);
+""")
+print("All relationships:", cur.fetchall())
+
+# Test upsert with another message
+row2 = {"from_name": "fromname_4", "from_ip": "203.0.113.14", "by_ip": "198.51.100.24", "by_name": "by_name4", "msg_ids": ["msg_id5"], "cnt": 1, "timestamp": "Saturday 2024"}
+print("\n--- Testing upsert with second message ---")
+upsert_hop_relationship("demo_clean", row2)
+
+# Final verification
+cur.execute("""
+SELECT * FROM cypher('demo_clean', $$
+  MATCH (a:Host)-[r:HOP]->(b:Host)
+  RETURN a.name, a.ip, r.cnt, r.msg_ids, r.timestamp, b.name, b.ip
+$$) AS (from_name agtype, from_ip agtype, cnt agtype, msg_ids agtype, timestamp agtype, to_name agtype, to_ip agtype);
+""")
+print("Final state:", cur.fetchall())
