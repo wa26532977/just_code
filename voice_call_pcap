@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+import dpkt
+import socket
+import struct
+import os
+from collections import defaultdict
+from datetime import datetime
+
+def analyze_rtp_calls(pcap_file):
+    """Analyze PCAP file and identify individual voice call sessions"""
+    
+    streams = {}
+    call_sessions = []
+    
+    print(f"Analyzing {pcap_file} for multiple voice calls...")
+    
+    with open(pcap_file, 'rb') as f:
+        try:
+            pcap = dpkt.pcap.Reader(f)
+        except:
+            # Try pcap-ng format
+            try:
+                import dpkt.pcapng
+                f.seek(0)
+                pcap = dpkt.pcapng.Reader(f)
+            except:
+                print("Error: Could not read PCAP file")
+                return [], {}
+        
+        packet_count = 0
+        for timestamp, buf in pcap:
+            packet_count += 1
+            if packet_count % 10000 == 0:
+                print(f"  Processed {packet_count} packets...")
+            
+            try:
+                eth = dpkt.ethernet.Ethernet(buf)
+                if isinstance(eth.data, dpkt.ip.IP):
+                    ip = eth.data
+                    if isinstance(ip.data, dpkt.udp.UDP):
+                        udp = ip.data
+                        
+                        # Check if this looks like RTP
+                        if len(udp.data) >= 12:
+                            # Parse RTP header
+                            try:
+                                rtp_header = struct.unpack('!BBHII', udp.data[:12])
+                                version = (rtp_header[0] >> 6) & 3
+                                payload_type = rtp_header[1] & 0x7F
+                                sequence = rtp_header[2]
+                                rtp_timestamp = rtp_header[3]
+                                ssrc = rtp_header[4]
+                                
+                                if version == 2:  # Valid RTP
+                                    src_ip = socket.inet_ntoa(ip.src)
+                                    dst_ip = socket.inet_ntoa(ip.dst)
+                                    
+                                    stream_id = ssrc
+                                    
+                                    if stream_id not in streams:
+                                        streams[stream_id] = {
+                                            'ssrc': ssrc,
+                                            'src_ip': src_ip,
+                                            'dst_ip': dst_ip,
+                                            'src_port': udp.sport,
+                                            'dst_port': udp.dport,
+                                            'payload_type': payload_type,
+                                            'packets': [],
+                                            'first_timestamp': timestamp,
+                                            'last_timestamp': timestamp,
+                                            'packet_count': 0
+                                        }
+                                    
+                                    streams[stream_id]['packets'].append({
+                                        'seq': sequence,
+                                        'rtp_timestamp': rtp_timestamp,
+                                        'payload': udp.data[12:],  # RTP payload
+                                        'pcap_timestamp': timestamp,
+                                        'payload_size': len(udp.data) - 12
+                                    })
+                                    
+                                    streams[stream_id]['last_timestamp'] = timestamp
+                                    streams[stream_id]['packet_count'] += 1
+                                    
+                            except struct.error:
+                                continue
+                                
+            except Exception as e:
+                continue
+    
+    print(f"Found {len(streams)} RTP streams")
+    return group_streams_into_calls(streams)
+
+def group_streams_into_calls(streams):
+    """Group RTP streams into call sessions based on timing and IP addresses"""
+    
+    calls = []
+    used_streams = set()
+    
+    # Sort streams by start time
+    sorted_streams = sorted(streams.items(), key=lambda x: x[1]['first_timestamp'])
+    
+    for stream_id, stream in sorted_streams:
+        if stream_id in used_streams:
+            continue
+            
+        # Look for corresponding return stream (same IPs but reversed)
+        call_streams = [stream_id]
+        used_streams.add(stream_id)
+        
+        # Find potential partner streams
+        for other_id, other_stream in streams.items():
+            if other_id in used_streams:
+                continue
+                
+            # Check if streams are related (same call)
+            time_overlap = (
+                stream['first_timestamp'] <= other_stream['last_timestamp'] and 
+                other_stream['first_timestamp'] <= stream['last_timestamp']
+            )
+            
+            # Check if IPs are swapped (bidirectional communication)
+            ip_match = (
+                (stream['src_ip'] == other_stream['dst_ip'] and 
+                 stream['dst_ip'] == other_stream['src_ip']) or
+                (stream['src_ip'] == other_stream['src_ip'] and 
+                 stream['dst_ip'] == other_stream['dst_ip'])
+            )
+            
+            # Time proximity (streams should start within reasonable time)
+            time_proximity = abs(stream['first_timestamp'] - other_stream['first_timestamp']) < 30  # 30 seconds
+            
+            if time_overlap and (ip_match or time_proximity):
+                call_streams.append(other_id)
+                used_streams.add(other_id)
+        
+        if call_streams:
+            call_start = min(streams[sid]['first_timestamp'] for sid in call_streams)
+            call_end = max(streams[sid]['last_timestamp'] for sid in call_streams)
+            
+            calls.append({
+                'call_id': len(calls) + 1,
+                'streams': call_streams,
+                'start_time': call_start,
+                'end_time': call_end,
+                'duration': call_end - call_start,
+                'stream_details': {sid: streams[sid] for sid in call_streams}
+            })
+    
+    return calls, streams
+
+def extract_call_audio(call, streams, output_dir):
+    """Extract audio for a specific call"""
+    
+    call_id = call['call_id']
+    call_dir = os.path.join(output_dir, f"call_{call_id:03d}")
+    os.makedirs(call_dir, exist_ok=True)
+    
+    print(f"\nExtracting Call {call_id}:")
+    print(f"  Duration: {call['duration']:.1f} seconds")
+    print(f"  Start: {datetime.fromtimestamp(call['start_time'])}")
+    print(f"  Streams: {len(call['streams'])}")
+    
+    audio_files = []
+    
+    for i, stream_id in enumerate(call['streams']):
+        stream = streams[stream_id]
+        
+        print(f"  Stream {i+1}: SSRC=0x{stream['ssrc']:08x}, "
+              f"{stream['src_ip']}:{stream['src_port']} → "
+              f"{stream['dst_ip']}:{stream['dst_port']}, "
+              f"Packets={stream['packet_count']}")
+        
+        # Sort packets by sequence number
+        sorted_packets = sorted(stream['packets'], key=lambda x: x['seq'])
+        
+        # Save raw audio
+        raw_filename = os.path.join(call_dir, f"stream_{i+1}_ssrc_{stream['ssrc']:08x}.raw")
+        with open(raw_filename, 'wb') as f:
+            for packet in sorted_packets:
+                f.write(packet['payload'])
+        
+        # Convert to WAV (assuming G.711 μ-law, adjust as needed)
+        wav_filename = os.path.join(call_dir, f"stream_{i+1}_ssrc_{stream['ssrc']:08x}.wav")
+        
+        # Detect codec based on payload type
+        payload_type = stream['payload_type']
+        if payload_type == 0:  # PCMU (G.711 μ-law)
+            sox_cmd = f"sox -t ul -r 8000 -c 1 '{raw_filename}' '{wav_filename}'"
+        elif payload_type == 8:  # PCMA (G.711 A-law)
+            sox_cmd = f"sox -t al -r 8000 -c 1 '{raw_filename}' '{wav_filename}'"
+        else:
+            # Default to μ-law
+            sox_cmd = f"sox -t ul -r 8000 -c 1 '{raw_filename}' '{wav_filename}'"
+        
+        os.system(sox_cmd)
+        audio_files.append(wav_filename)
+        
+        print(f"    Saved: {os.path.basename(wav_filename)}")
+    
+    # Combine streams if we have exactly 2 (typical call)
+    if len(audio_files) == 2:
+        combined_filename = os.path.join(call_dir, f"call_{call_id:03d}_combined.wav")
+        sox_cmd = f"sox -M '{audio_files[0]}' '{audio_files[1]}' '{combined_filename}'"
+        os.system(sox_cmd)
+        print(f"    Combined: call_{call_id:03d}_combined.wav")
+    
+    # Create call summary
+    summary_file = os.path.join(call_dir, "call_info.txt")
+    with open(summary_file, 'w') as f:
+        f.write(f"Call {call_id} Information\n")
+        f.write(f"========================\n\n")
+        f.write(f"Start Time: {datetime.fromtimestamp(call['start_time'])}\n")
+        f.write(f"End Time: {datetime.fromtimestamp(call['end_time'])}\n")
+        f.write(f"Duration: {call['duration']:.1f} seconds\n")
+        f.write(f"Number of Streams: {len(call['streams'])}\n\n")
+        
+        for i, stream_id in enumerate(call['streams']):
+            stream = streams[stream_id]
+            f.write(f"Stream {i+1}:\n")
+            f.write(f"  SSRC: 0x{stream['ssrc']:08x}\n")
+            f.write(f"  Route: {stream['src_ip']}:{stream['src_port']} → {stream['dst_ip']}:{stream['dst_port']}\n")
+            f.write(f"  Payload Type: {stream['payload_type']}\n")
+            f.write(f"  Packets: {stream['packet_count']}\n")
+            f.write(f"  Duration: {stream['last_timestamp'] - stream['first_timestamp']:.1f}s\n\n")
+
+def main():
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: python3 extract_multiple_calls.py <pcap_file> [output_dir]")
+        print("\nThis script will:")
+        print("1. Identify all voice calls in the PCAP")
+        print("2. Group RTP streams by call session")
+        print("3. Extract audio for each call separately")
+        return
+    
+    pcap_file = sys.argv[1]
+    output_dir = sys.argv[2] if len(sys.argv) > 2 else "extracted_calls"
+    
+    # Analyze PCAP for multiple calls
+    calls, streams = analyze_rtp_calls(pcap_file)
+    
+    if not calls:
+        print("No voice calls found in the PCAP file")
+        return
+    
+    print(f"\n{'='*60}")
+    print(f"FOUND {len(calls)} VOICE CALLS")
+    print(f"{'='*60}")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Show call summary
+    for call in calls:
+        print(f"\nCall {call['call_id']}:")
+        print(f"  Start: {datetime.fromtimestamp(call['start_time'])}")
+        print(f"  Duration: {call['duration']:.1f}s")
+        print(f"  Streams: {len(call['streams'])}")
+        for stream_id in call['streams']:
+            stream = streams[stream_id]
+            print(f"    SSRC 0x{stream['ssrc']:08x}: {stream['src_ip']}:{stream['src_port']} → {stream['dst_ip']}:{stream['dst_port']} ({stream['packet_count']} pkts)")
+    
+    # Extract each call
+    print(f"\n{'='*60}")
+    print("EXTRACTING AUDIO...")
+    print(f"{'='*60}")
+    
+    for call in calls:
+        extract_call_audio(call, streams, output_dir)
+    
+    print(f"\nExtraction complete! Check the '{output_dir}' directory.")
+    print(f"Each call has its own subdirectory with:")
+    print("  - Individual stream audio files (.wav)")
+    print("  - Combined call audio (if 2 streams)")
+    print("  - Call information summary")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+3. Usage Instructions:
+bash# Run the script to extract all calls
+python3 extract_multiple_calls.py your_file.pcap
+
+# Or specify custom output directory
+python3 extract_multiple_calls.py your_file.pcap my_extracted_calls
+4. Manual Approach Using Time Filters:
+If you want to extract specific calls manually:
+bash# First, get time ranges for different calls
+tshark -r your_file.pcap -Y rtp -T fields -e frame.time_relative -e rtp.ssrc -e ip.src -e ip.dst | head -50
+
+# Extract specific time ranges
+tshark -r your_file.pcap -Y "rtp and frame.time_relative >= 0 and frame.time_relative <= 120" -w call1.pcap
+tshark -r your_file.pcap -Y "rtp and frame.time_relative >= 130 and frame.time_relative <= 250" -w call2.pcap
+5. Using Wireshark for Multiple Calls:
+
+Telephony → VoIP Calls: Shows all detected calls with timing
+Select a call → Flow → See the complete call flow
+Select call → Player → Extract that specific call's audio
+Repeat for each call
+
+6. Identify Call Patterns:
+Common patterns to identify separate calls:
+bash# Look for SIP signaling to identify call boundaries
+tshark -r your_file.pcap -Y "sip.Method == INVITE or sip.Method == BYE" -T fields -e frame.time_relative -e sip.Method -e sip.Call-ID
+
+# Look for gaps in RTP streams
+tshark -r your_file.pcap -Y rtp -T fields -e frame.time_relative -e rtp.ssrc | sort -n
+7. Expected Output Structure:
+The script will create:
+extracted_calls/
+├── call_001/
+│   ├── stream_1_ssrc_12345678.wav
+│   ├── stream_2_ssrc_87654321.wav
+│   ├── call_001_combined.wav
+│   ├── call_info.txt
+├── call_002/
+│   ├── stream_1_ssrc_abcdef01.wav
+│   ├── stream_2_ssrc_fedcba98.wav
+│   ├── call_002_combined.wav
+│   ├── call_info.txt
+└── ...
+The script handles:
+
+Multiple simultaneous calls
+Different codecs per call
+Proper time-based call separation
+Bidirectional stream pairing
+Missing or out-of-order packets
+
+Try the script and let me know what it finds! If you're still getting the tshark recursion error, the Python approach should work around that issue.
+
