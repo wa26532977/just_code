@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+# rtp_extractor.py - Pure Python RTP extractor with G.711 and G.729 support
+
+from scapy.all import *
+import struct
+import sys
+import os
+
+def extract_rtp_streams(pcap_file, output_dir="rtp_output"):
+    """Extract RTP streams to separate files with G.711 and G.729 support"""
+    
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    print(f"Processing {pcap_file}...")
+    
+    try:
+        packets = rdpcap(pcap_file)
+        print(f"Loaded {len(packets)} packets")
+    except:
+        print("Error reading PCAP file")
+        return
+    
+    streams = {}  # Key: (src_ip, src_port, dst_ip, dst_port, ssrc)
+    
+    for packet in packets:
+        # Handle VLAN tags automatically (Scapy does this transparently)
+        if packet.haslayer(UDP) and len(packet[UDP].payload) >= 12:
+            udp_payload = bytes(packet[UDP].payload)
+            
+            # Basic RTP header check
+            version = (udp_payload[0] >> 6) & 0x3
+            if version == 2:  # RTP version 2
+                pt = udp_payload[1] & 0x7F
+                seq = struct.unpack('!H', udp_payload[2:4])[0]
+                timestamp = struct.unpack('!I', udp_payload[4:8])[0]
+                ssrc = struct.unpack('!I', udp_payload[8:12])[0]
+                
+                # Get network info
+                src_ip = packet[IP].src
+                dst_ip = packet[IP].dst
+                src_port = packet[UDP].sport
+                dst_port = packet[UDP].dport
+                
+                stream_key = (src_ip, src_port, dst_ip, dst_port, ssrc)
+                
+                if stream_key not in streams:
+                    streams[stream_key] = []
+                
+                # Extract RTP payload (handle CSRC and extensions)
+                cc = udp_payload[0] & 0xF  # CSRC count
+                has_extension = (udp_payload[0] >> 4) & 0x1
+                has_padding = (udp_payload[0] >> 5) & 0x1
+                
+                header_len = 12 + (cc * 4)  # Basic header + CSRC
+                
+                # Handle extension header
+                if has_extension and len(udp_payload) >= header_len + 4:
+                    ext_len = struct.unpack('!H', udp_payload[header_len+2:header_len+4])[0]
+                    header_len += 4 + (ext_len * 4)
+                
+                if len(udp_payload) > header_len:
+                    payload = udp_payload[header_len:]
+                    
+                    # Handle padding
+                    if has_padding and len(payload) > 0:
+                        pad_len = payload[-1]
+                        if pad_len <= len(payload):
+                            payload = payload[:-pad_len]
+                    
+                    streams[stream_key].append((seq, timestamp, payload, pt))
+    
+    print(f"Found {len(streams)} RTP streams")
+    
+    # Process and save streams
+    for stream_key, packets in streams.items():
+        src_ip, src_port, dst_ip, dst_port, ssrc = stream_key
+        
+        if len(packets) < 5:  # Skip streams with too few packets
+            continue
+        
+        # Sort by sequence number
+        packets.sort(key=lambda x: x[0])
+        
+        # Analyze payload sizes and payload types
+        payload_sizes = [len(pkt[2]) for pkt in packets if len(pkt[2]) > 0]
+        payload_types = [pkt[3] for pkt in packets]
+        
+        if not payload_sizes:
+            continue
+            
+        most_common_size = max(set(payload_sizes), key=payload_sizes.count)
+        most_common_pt = max(set(payload_types), key=payload_types.count)
+        
+        # Determine codec based on payload type and size
+        codec = "unknown"
+        format_name = ""
+        
+        if most_common_pt == 0:  # G.711 PCMU (μ-law)
+            codec = "g711_mulaw"
+            format_name = "mulaw"
+        elif most_common_pt == 8:  # G.711 PCMA (A-law)
+            codec = "g711_alaw"
+            format_name = "alaw"
+        elif most_common_pt == 18:  # G.729
+            codec = "g729"
+            format_name = "g729"
+        elif most_common_pt == 9:  # G.722
+            codec = "g722"
+            format_name = "g722"
+        else:
+            # Try to guess from payload size
+            if most_common_size == 160:
+                codec = "g711_unknown"
+                format_name = "mulaw"  # Default to μ-law
+            elif most_common_size == 20:
+                codec = "g729"
+                format_name = "g729"
+            elif most_common_size == 80:
+                codec = "g722"
+                format_name = "g722"
+        
+        # Create filename
+        filename = f"{output_dir}/rtp_{src_ip}_{src_port}_{dst_ip}_{dst_port}_{ssrc:08x}_{codec}.raw"
+        
+        print(f"\n=== Stream: {src_ip}:{src_port} -> {dst_ip}:{dst_port} ===")
+        print(f"SSRC: {ssrc:08x}")
+        print(f"Payload Type: {most_common_pt}")
+        print(f"Codec: {codec}")
+        print(f"Common payload size: {most_common_size} bytes")
+        print(f"Total packets: {len(packets)}")
+        
+        # Filter and save payloads based on codec
+        speech_frames = 0
+        total_audio_data = b''
+        
+        for seq, ts, payload, pt in packets:
+            payload_len = len(payload)
+            
+            if codec.startswith("g711"):
+                # G.711: Keep 160-byte payloads (20ms at 8kHz)
+                if payload_len == 160:
+                    total_audio_data += payload
+                    speech_frames += 1
+            elif codec == "g729":
+                # G.729: Keep 20-byte (speech) and 10-byte frames, skip 2-byte SID frames
+                if payload_len in [20, 10]:
+                    total_audio_data += payload
+                    speech_frames += 1
+            elif codec == "g722":
+                # G.722: Keep standard frames
+                if payload_len in [80, 160]:
+                    total_audio_data += payload
+                    speech_frames += 1
+            else:
+                # Unknown codec: keep all non-empty payloads
+                if payload_len > 0:
+                    total_audio_data += payload
+                    speech_frames += 1
+        
+        print(f"Speech frames extracted: {speech_frames}")
+        
+        if speech_frames > 0 and len(total_audio_data) > 0:
+            # Save raw audio data
+            with open(filename, 'wb') as f:
+                f.write(total_audio_data)
+            
+            print(f"Raw file: {filename}")
+            print(f"Raw size: {len(total_audio_data)} bytes")
+            
+            # Convert to WAV using ffmpeg
+            wav_file = filename.replace('.raw', '.wav')
+            
+            if codec.startswith("g711_mulaw") or (codec == "g711_unknown"):
+                # G.711 μ-law
+                cmd = f'ffmpeg -y -loglevel error -f mulaw -ar 8000 -ac 1 -i "{filename}" -acodec pcm_s16le -ar 8000 "{wav_file}"'
+                result = os.system(cmd)
+                if result == 0:
+                    print(f"WAV file (μ-law): {wav_file}")
+                
+            elif codec == "g711_alaw":
+                # G.711 A-law
+                cmd = f'ffmpeg -y -loglevel error -f alaw -ar 8000 -ac 1 -i "{filename}" -acodec pcm_s16le -ar 8000 "{wav_file}"'
+                result = os.system(cmd)
+                if result == 0:
+                    print(f"WAV file (A-law): {wav_file}")
+                
+            elif codec == "g729":
+                # G.729
+                cmd = f'ffmpeg -y -loglevel error -f g729 -i "{filename}" -acodec pcm_s16le -ar 8000 -ac 1 "{wav_file}"'
+                result = os.system(cmd)
+                if result == 0:
+                    print(f"WAV file (G.729): {wav_file}")
+                
+            elif codec == "g722":
+                # G.722 (16kHz)
+                cmd = f'ffmpeg -y -loglevel error -f g722 -i "{filename}" -acodec pcm_s16le -ar 16000 -ac 1 "{wav_file}"'
+                result = os.system(cmd)
+                if result == 0:
+                    print(f"WAV file (G.722): {wav_file}")
+            
+            # If codec detection was uncertain and it's G.711, try both
+            if codec == "g711_unknown" and most_common_size == 160:
+                # Also try A-law
+                alaw_wav = wav_file.replace('.wav', '_alaw.wav')
+                cmd = f'ffmpeg -y -loglevel error -f alaw -ar 8000 -ac 1 -i "{filename}" -acodec pcm_s16le -ar 8000 "{alaw_wav}"'
+                result = os.system(cmd)
+                if result == 0:
+                    print(f"WAV file (A-law): {alaw_wav}")
+                    print("Note: Try both μ-law and A-law versions to see which sounds better")
+        else:
+            print("No valid audio data found")
+    
+    print(f"\n=== Extraction Summary ===")
+    print(f"Output directory: {output_dir}")
+    wav_files = [f for f in os.listdir(output_dir) if f.endswith('.wav')]
+    print(f"WAV files created: {len(wav_files)}")
+    for wav in sorted(wav_files):
+        print(f"  {wav}")
+
+def analyze_codecs(pcap_file):
+    """Quick analysis of codecs in the PCAP file"""
+    print("=== Codec Analysis ===")
+    
+    try:
+        packets = rdpcap(pcap_file)
+    except:
+        print("Error reading PCAP file")
+        return
+    
+    payload_types = {}
+    payload_sizes = {}
+    
+    for packet in packets:
+        if packet.haslayer(UDP) and len(packet[UDP].payload) >= 12:
+            udp_payload = bytes(packet[UDP].payload)
+            
+            version = (udp_payload[0] >> 6) & 0x3
+            if version == 2:  # RTP
+                pt = udp_payload[1] & 0x7F
+                
+                # Extract payload
+                cc = udp_payload[0] & 0xF
+                header_len = 12 + (cc * 4)
+                
+                if len(udp_payload) > header_len:
+                    payload_len = len(udp_payload) - header_len
+                    
+                    payload_types[pt] = payload_types.get(pt, 0) + 1
+                    payload_sizes[payload_len] = payload_sizes.get(payload_len, 0) + 1
+    
+    print("Payload Types found:")
+    for pt, count in sorted(payload_types.items()):
+        codec_name = "Unknown"
+        if pt == 0:
+            codec_name = "G.711 PCMU (μ-law)"
+        elif pt == 8:
+            codec_name = "G.711 PCMA (A-law)"
+        elif pt == 18:
+            codec_name = "G.729"
+        elif pt == 9:
+            codec_name = "G.722"
+        
+        print(f"  PT {pt}: {count} packets ({codec_name})")
+    
+    print("\nPayload Sizes found:")
+    for size, count in sorted(payload_sizes.items()):
+        likely_codec = "Unknown"
+        if size == 160:
+            likely_codec = "Likely G.711"
+        elif size == 20:
+            likely_codec = "Likely G.729 speech"
+        elif size == 2:
+            likely_codec = "Likely G.729 SID"
+        elif size == 80:
+            likely_codec = "Likely G.722"
+        
+        print(f"  {size} bytes: {count} packets ({likely_codec})")
+    print()
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python3 rtp_extractor.py input.pcap")
+        print("\nThis script extracts RTP streams and converts them to WAV files.")
+        print("Supports G.711 (μ-law/A-law), G.729, and G.722 codecs.")
+        print("Handles pcapng format and VLAN tags automatically.")
+        sys.exit(1)
+    
+    pcap_file = sys.argv[1]
+    
+    if not os.path.exists(pcap_file):
+        print(f"Error: File {pcap_file} not found")
+        sys.exit(1)
+    
+    # First analyze what codecs are in the file
+    analyze_codecs(pcap_file)
+    
+    # Then extract the streams
+    extract_rtp_streams(pcap_file)
