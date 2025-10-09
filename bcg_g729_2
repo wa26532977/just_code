@@ -1,0 +1,251 @@
+# tshark -r merged.pcap -d udp.port==10000-1000000,rtp -T fields -e ip.src -e rtp.ssrc | sort | uniq -c
+# tshark -r call.pcap -Y "rtp && rtp.ssrc==$SSRC && rtp.p_type==18" \
+#   -T fields \
+#   -e rtp.seq \
+#   -e frame.time_epoch \
+#   -e rtp.marker \
+#   -e rtp.payload \
+#   > g729_$SSRC.csv
+
+
+import sys, binascii
+
+csv = sys.argv[1]
+rows = []
+with open(csv) as f:
+    for line in f:
+        parts = line.strip().split('\t')
+        if len(parts) < 4:  # seq, time, marker, payload
+            continue
+        seq = int(parts[0])
+        payload_hex = parts[3].replace(':','').strip()
+        payload = binascii.unhexlify(payload_hex) if payload_hex else b''
+        rows.append((seq, payload))
+
+# sort by seq with wraparound awareness (simple: Python's sort on ints is fine unless capture spans multiple wraps)
+rows.sort(key=lambda r: r[0])
+
+frames = []
+for seq, payload in rows:
+    n = len(payload)
+    if n == 0:
+        # nothing; you may want to record a lost/concealed frame here if expected
+        continue
+    if n == 2:
+        frames.append((seq, payload, True))  # SID
+    elif n % 10 == 0:
+        for i in range(0, n, 10):
+            frames.append((seq, payload[i:i + 10], False))  # speech frames
+    else:
+        # Unknown sizing; drop or log as corrupted
+        continue
+
+# Write outputs
+off = 0
+with open('frames.bin', 'wb') as fb, open('index.txt', 'w') as fi:
+    for (seq, fr, is_sid) in frames:
+        fb.write(fr)
+        fi.write(f"{seq}\t{off}\t{len(fr)}\t{1 if is_sid else 0}\t0\n")
+        off += len(fr)
+
+print("Wrote frames.bin and index.txt")
+
+
+
+
+
+
+
+
+
+
+gcc -O2 -o g729b_to_wav bcg_729_pcm.c -lbcg729
+dmgr@dmgr-voip:~/PycharmProjects/PythonProject/voip_decode$ ./g729b_to_wav index.txt frames.bin out.wav
+
+
+
+// g729b_to_wav.c
+// Build:  gcc -O2 -o g729b_to_wav g729b_to_wav.c -lbcg729
+// Usage:  ./g729b_to_wav index.txt frames.bin out.wav
+//
+// Expects index.txt lines: seq \t offset \t length \t is_sid \t erased
+// Example: 34567    0       10      0       0
+//          34568    10      10      0       0
+//          34569    20      2       1       0
+//          34570    22      0       0       1   (erased 10 ms; offset/len ignored)
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <errno.h>
+#include <bcg729/decoder.h>
+
+#define SAMPLES_PER_FRAME 80     // 10 ms at 8 kHz
+#define SAMPLE_RATE       8000
+#define CHANNELS          1
+#define BITS_PER_SAMPLE   16
+
+static void write_wav_header(FILE *f, uint32_t data_bytes) {
+    // Minimal PCM WAV header (44 bytes)
+    uint32_t riff_size = 36 + data_bytes;
+    uint16_t audio_format = 1; // PCM
+    uint32_t byte_rate = SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE/8);
+    uint16_t block_align = CHANNELS * (BITS_PER_SAMPLE/8);
+
+    // RIFF chunk
+    fwrite("RIFF", 1, 4, f);
+    fwrite(&riff_size, 4, 1, f);
+    fwrite("WAVE", 1, 4, f);
+
+    // fmt  chunk
+    fwrite("fmt ", 1, 4, f);
+    uint32_t fmt_size = 16;
+    fwrite(&fmt_size, 4, 1, f);
+    fwrite(&audio_format, 2, 1, f);
+    uint16_t ch = CHANNELS;
+    fwrite(&ch, 2, 1, f);
+    uint32_t sr = SAMPLE_RATE;
+    fwrite(&sr, 4, 1, f);
+    fwrite(&byte_rate, 4, 1, f);
+    fwrite(&block_align, 2, 1, f);
+    uint16_t bps = BITS_PER_SAMPLE;
+    fwrite(&bps, 2, 1, f);
+
+    // data chunk
+    fwrite("data", 1, 4, f);
+    fwrite(&data_bytes, 4, 1, f);
+}
+
+// After writing PCM, patch header sizes (call at the end)
+static int patch_wav_sizes(FILE *f) {
+    long file_end = ftell(f);
+    if (file_end < 0) return -1;
+
+    uint32_t data_bytes = (uint32_t)(file_end - 44);
+    uint32_t riff_size = 36 + data_bytes;
+
+    // patch RIFF size
+    if (fseek(f, 4, SEEK_SET) != 0) return -1;
+    fwrite(&riff_size, 4, 1, f);
+
+    // patch data size
+    if (fseek(f, 40, SEEK_SET) != 0) return -1;
+    fwrite(&data_bytes, 4, 1, f);
+
+    // return to end so callers can close cleanly
+    fseek(f, 0, SEEK_END);
+    return 0;
+}
+
+static void die(const char *msg) {
+    fprintf(stderr, "Error: %s (%s)\n", msg, strerror(errno));
+    exit(1);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        fprintf(stderr, "Usage: %s index.txt frames.bin out.wav\n", argv[0]);
+        return 2;
+    }
+
+    const char *index_path  = argv[1];
+    const char *frames_path = argv[2];
+    const char *wav_path    = argv[3];
+
+    FILE *fi = fopen(index_path, "r");
+    if (!fi) die("open index.txt");
+
+    FILE *fb = fopen(frames_path, "rb");
+    if (!fb) die("open frames.bin");
+
+    FILE *fw = fopen(wav_path, "wb+");
+    if (!fw) die("open out.wav");
+
+    // Placeholder header; we’ll patch sizes later.
+    write_wav_header(fw, 0);
+
+    // Init bcg729 decoder
+    bcg729DecoderChannelContextStruct *dec = initBcg729DecoderChannel();
+    if (!dec) die("initBcg729DecoderChannel failed");
+
+    char line[256];
+    int64_t total_frames = 0;
+
+    // Reusable buffers
+    uint8_t  bs[10];     // max G.729 bitstream we expect to feed (10 for speech, 2 for SID)
+    int16_t  pcm[SAMPLES_PER_FRAME];
+
+    while (fgets(line, sizeof(line), fi)) {
+        // Columns: seq offset length is_sid erased  (tab- or space-separated ok)
+        unsigned seq = 0;
+        long long offset = 0;
+        unsigned length = 0, is_sid = 0, erased = 0;
+
+        // Try reading with tabs first; fallback allows spaces
+        int n = sscanf(line, "%u%*[ \t]%lld%*[ \t]%u%*[ \t]%u%*[ \t]%u",
+                       &seq, &offset, &length, &is_sid, &erased);
+        if (n != 5) {
+            // skip malformed lines quietly
+            continue;
+        }
+
+        if (erased) {
+            // Packet loss concealment for one 10 ms frame
+            // frame_erased=1, no bitstream consumed
+            bcg729Decoder(dec, NULL, 0, /*frame_erased=*/1, /*is_sid=*/0, /*rfc3389=*/0, pcm);
+            if (fwrite(pcm, sizeof(int16_t), SAMPLES_PER_FRAME, fw) != SAMPLES_PER_FRAME)
+                die("write PCM (erased)");
+            total_frames++;
+            continue;
+        }
+
+        // Not erased: read the bitstream chunk from frames.bin
+        if (length != 10 && length != 2) {
+            // Ignore unexpected sizes; you could log these if needed.
+            fprintf(stderr, "Skipping seq=%u with unexpected length=%u\n", seq, length);
+            continue;
+        }
+
+        if (fseek(fb, offset, SEEK_SET) != 0) die("fseek frames.bin");
+        if (fread(bs, 1, length, fb) != length) die("fread frames.bin");
+
+        uint8_t frame_erased = 0;
+        uint8_t bitstream_len = (uint8_t)length;
+        uint8_t sid_flag = (uint8_t)(is_sid ? 1 : (length==2 ? 1 : 0));
+        uint8_t rfc3389_cng = 0; // we are not feeding RFC3389 CNG here
+
+        // Decode one 10 ms frame -> 80 PCM samples @ 8 kHz
+        bcg729Decoder(dec, bs, bitstream_len, frame_erased, sid_flag, rfc3389_cng, pcm);
+
+        if (fwrite(pcm, sizeof(int16_t), SAMPLES_PER_FRAME, fw) != SAMPLES_PER_FRAME)
+            die("write PCM (normal)");
+        total_frames++;
+    }
+
+    closeBcg729DecoderChannel(dec);
+
+    // Patch WAV sizes now that we know how many samples we wrote
+    if (patch_wav_sizes(fw) != 0) die("patch_wav_sizes");
+
+    fclose(fi);
+    fclose(fb);
+    fclose(fw);
+
+    fprintf(stderr, "Done. Wrote %lld frames (~%lld ms) to %s\n",
+            (long long)total_frames, (long long)(total_frames * 10), wav_path);
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
