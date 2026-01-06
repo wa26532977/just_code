@@ -3,3 +3,16 @@ wget -O /data/tiktoken_encodings/o200k_base.tiktoken \
   "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
 wget -O /data/tiktoken_encodings/cl100k_base.tiktoken \
   "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
+
+
+
+
+
+
+python3 -m venv /tmp/harmony && source /tmp/harmony/bin/activate
+pip install openai-harmony
+
+mkdir -p /tmp/tiktoken_rs_cache
+TIKTOKEN_RS_CACHE_DIR=/tmp/tiktoken_rs_cache \
+python -c 'from openai_harmony import load_harmony_encoding; load_harmony_encoding("HarmonyGptOss")'
+
