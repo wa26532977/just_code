@@ -1,0 +1,5 @@
+mkdir -p /data/tiktoken_encodings
+wget -O /data/tiktoken_encodings/o200k_base.tiktoken \
+  "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
+wget -O /data/tiktoken_encodings/cl100k_base.tiktoken \
+  "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
