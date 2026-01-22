@@ -1,0 +1,52 @@
+Ubuntu 22.04 ships with Python 3.10, and installing Python 3.8.2 via apt is usually not straightforward (old 3.x builds often aren’t available for Jammy because they need older OpenSSL). The cleanest way is to install it per-user with pyenv (doesn’t break your system Python).
+
+Option A (recommended): install Python 3.8.2 with pyenv
+1) Install build dependencies
+sudo apt update
+sudo apt install -y \
+  build-essential make gcc \
+  libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+  libncursesw5-dev xz-utils tk-dev libffi-dev liblzma-dev \
+  curl git
+
+2) Install pyenv
+curl https://pyenv.run | bash
+
+
+Add pyenv to your shell (bash). Append this to ~/.bashrc:
+
+export PYENV_ROOT="$HOME/.pyenv"
+command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init -)"
+
+
+Reload your shell:
+
+exec "$SHELL"
+
+3) Install Python 3.8.2 and use it
+pyenv install 3.8.2
+pyenv global 3.8.2   # or: pyenv local 3.8.2 (per-project)
+python --version
+
+4) Create a virtual environment (recommended)
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip setuptools wheel
+
+
+If you hit an SSL build error, pyenv’s “common build problems” page is the canonical troubleshooting reference.
+
+Important: don’t replace /usr/bin/python3 or change Ubuntu’s system Python—many OS tools depend on it.
+
+Option B: use a container (fastest if you just need 3.8.2 for a project)
+
+Python 3.8.2 exists as an official Docker image tag:
+
+docker run -it --rm python:3.8.2 python --version
+
+Why apt install python3.8 often won’t work on 22.04
+
+Even the common PPA approach may not provide older builds on Jammy due to OpenSSL/library constraints.
+
+If you tell me whether you need system-wide /usr/local install (for all users) or just for your user/project, I can tailor the exact steps (pyenv vs source vs container) and the right paths.
