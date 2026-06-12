@@ -1,0 +1,177 @@
+import re
+from typing import List
+
+
+SENTENCE_ENDINGS = r".!?。！？؛؟।॥"
+
+
+def split_into_sentences_multilingual(text: str) -> List[str]:
+    """
+    Simple multilingual sentence splitter.
+    Supports common sentence endings:
+    English/European: . ! ?
+    Chinese/Japanese: 。！？
+    Arabic/Persian/Urdu: ؟ ؛
+    Hindi/Indic: । ॥
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    pattern = rf"(?<=[{re.escape(SENTENCE_ENDINGS)}])\s+"
+    parts = re.split(pattern, text)
+
+    return [p.strip() for p in parts if p.strip()]
+
+
+
+
+
+import re
+from typing import List
+
+
+SENTENCE_ENDINGS = r".!?。！？؛؟।॥"
+
+
+def split_into_sentences_multilingual(text: str) -> List[str]:
+    text = text.strip()
+    if not text:
+        return []
+
+    # Split after sentence-ending punctuation followed by whitespace/newline
+    pattern = rf"(?<=[{re.escape(SENTENCE_ENDINGS)}])\s+"
+    parts = re.split(pattern, text)
+
+    return [p.strip() for p in parts if p.strip()]
+
+
+def force_split_long_piece(text: str, max_chars: int) -> List[str]:
+    """
+    Last-resort split for text with no sentence boundaries.
+    Tries to split by commas/spaces before cutting hard.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    current = text.strip()
+
+    while len(current) > max_chars:
+        split_at = -1
+
+        # Prefer splitting near max_chars at soft boundaries
+        for sep in ["\n", "，", ",", "、", ";", "；", " "]:
+            pos = current.rfind(sep, 0, max_chars)
+            if pos > split_at:
+                split_at = pos
+
+        # If no good boundary, hard split
+        if split_at < max_chars * 0.5:
+            split_at = max_chars
+
+        chunks.append(current[:split_at].strip())
+        current = current[split_at:].strip()
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def chunk_text_multilingual(
+    text: str,
+    max_chars: int = 3000,
+    preserve_paragraphs: bool = True,
+) -> List[str]:
+    text = text.strip()
+    if not text:
+        return []
+
+    paragraphs = re.split(r"\n\s*\n", text) if preserve_paragraphs else [text]
+
+    chunks = []
+    current_chunk = ""
+
+    def add_piece(piece: str):
+        nonlocal current_chunk
+
+        if not piece.strip():
+            return
+
+        separator = "\n\n" if preserve_paragraphs and current_chunk else " "
+
+        if not current_chunk:
+            current_chunk = piece
+        elif len(current_chunk) + len(separator) + len(piece) <= max_chars:
+            current_chunk += separator + piece
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = piece
+
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+
+        if len(paragraph) <= max_chars:
+            add_piece(paragraph)
+            continue
+
+        sentences = split_into_sentences_multilingual(paragraph)
+
+        temp = ""
+
+        for sentence in sentences:
+            # If one sentence is still too long, force split it
+            if len(sentence) > max_chars:
+                if temp:
+                    add_piece(temp)
+                    temp = ""
+
+                for piece in force_split_long_piece(sentence, max_chars):
+                    add_piece(piece)
+
+                continue
+
+            if not temp:
+                temp = sentence
+            elif len(temp) + 1 + len(sentence) <= max_chars:
+                temp += " " + sentence
+            else:
+                add_piece(temp)
+                temp = sentence
+
+        if temp:
+            add_piece(temp)
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+text = """
+Hello world. This is English.
+
+你好世界。这是中文。
+
+こんにちは世界。これは日本語です。
+
+مرحبا بالعالم؟ هذا نص عربي.
+
+नमस्ते दुनिया। यह हिंदी है।
+"""
+
+chunks = chunk_text_multilingual(text, max_chars=100)
+
+for i, chunk in enumerate(chunks, 1):
+    print(f"--- Chunk {i} ---")
+    print(chunk)
+
+
+
+
+
+
+  
