@@ -1,0 +1,44 @@
+upstream paddleocr_backend {
+    # Round-robin is the default load-balancing method.
+    server 127.0.0.1:8004 max_fails=3 fail_timeout=30s;
+    server 127.0.0.1:8005 max_fails=3 fail_timeout=30s;
+    server 127.0.0.1:8006 max_fails=3 fail_timeout=30s;
+
+    keepalive 32;
+}
+
+server {
+    listen 8007;
+    listen [::]:8007;
+
+    server_name _;
+
+    # Adjust this if your uploaded PDFs or images are larger.
+    client_max_body_size 200M;
+
+    location / {
+        proxy_pass http://paddleocr_backend;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # OCR processing may take several minutes.
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+
+        # Avoid buffering large uploads and responses.
+        proxy_request_buffering off;
+        proxy_buffering off;
+
+        # Try another OCR instance if the selected backend fails.
+        proxy_next_upstream error timeout invalid_header
+                            http_500 http_502 http_503 http_504;
+        proxy_next_upstream_tries 3;
+    }
+}
